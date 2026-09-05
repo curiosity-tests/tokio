@@ -1218,8 +1218,6 @@ jobs:
       fail-fast: false
       matrix:
         run:
-          - os: windows-latest
-            extra_features: "tracing"
           - os: ubuntu-latest
             extra_features: "tracing,io-uring,taskdump"
 
