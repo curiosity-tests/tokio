@@ -28,7 +28,7 @@ concurrency:
 env:
   # The one variable that separates the arms: on baseline, action-checkout
   # skips its Set up Chalk step entirely.
-  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+  CHALK_ON: ${{ inputs.leg == 'instrumented' }}
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
   RUSTUP_WINDOWS_PATH_ADD_BIN: 1
@@ -1893,7 +1893,7 @@ jobs:
           - '4.19.325'
     uses: ./.github/workflows/uring-kernel-version-test.yml
     with:
-      chalk_on: ${{ (github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline') && 'true' || 'false' }}
+      chalk_on: ${{ inputs.leg == 'instrumented' && 'true' || 'false' }}
       profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
       kernel_version: ${{ matrix.kernel_version }}
 
