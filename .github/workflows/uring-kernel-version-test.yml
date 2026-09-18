@@ -31,118 +31,189 @@ jobs:
     env:
       KERNEL_VERSION: ${{ inputs.kernel_version }}
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential bison flex libssl-dev libelf-dev \
+          qemu-system-x86 busybox-static cpio xz-utils wget
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential bison flex libssl-dev libelf-dev \
-            qemu-system-x86 busybox-static cpio xz-utils wget
+    - name: Cache Linux source
+      id: cache-kernel
+      uses: actions/cache@v6
+      with:
+        path: linux-${{ env.KERNEL_VERSION }}
+        key: kernel-${{ env.KERNEL_VERSION }}
 
-      - name: Cache Linux source
-        id: cache-kernel
-        uses: actions/cache@v6
-        with:
-          path: linux-${{ env.KERNEL_VERSION }}
-          key: kernel-${{ env.KERNEL_VERSION }}
-
-      - name: Download & build Linux kernel
-        if: steps.cache-kernel.outputs.cache-hit != 'true'
-        run: |
-          MAJOR=${KERNEL_VERSION%%.*}
-          wget https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz
-          tar xf linux-${KERNEL_VERSION}.tar.xz
-          cd linux-${KERNEL_VERSION}
-          make defconfig
-          make -j$(nproc)
+    - name: Download & build Linux kernel
+      if: steps.cache-kernel.outputs.cache-hit != 'true'
+      run: |
+        MAJOR=${KERNEL_VERSION%%.*}
+        wget https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz
+        tar xf linux-${KERNEL_VERSION}.tar.xz
+        cd linux-${KERNEL_VERSION}
+        make defconfig
+        make -j$(nproc)
 
       # We are running tests also on a Kernel version that does not support io_uring
       # to check if the fallback mechanism works
-      - name: Generate test binaries with io_uring enabled
-        run: |
-          # Build both integration (tokio/tests/) and unit (e.g., tokio/src/fs/file/tests.rs) tests with io_uring enabled
-          rustup target add x86_64-unknown-linux-musl
-          RUSTFLAGS="--cfg tokio_unstable" \
-            cargo test -p tokio --features full,io-uring \
-            --target x86_64-unknown-linux-musl --test 'fs*' --lib --no-run
+    - name: Generate test binaries with io_uring enabled
+      run: |
+        # Build both integration (tokio/tests/) and unit (e.g., tokio/src/fs/file/tests.rs) tests with io_uring enabled
+        rustup target add x86_64-unknown-linux-musl
+        RUSTFLAGS="--cfg tokio_unstable" \
+          cargo test -p tokio --features full,io-uring \
+          --target x86_64-unknown-linux-musl --test 'fs*' --lib --no-run
 
-      - name: Prepare initramfs + tests binaries
-        run: |
-          set -e
-          rm -rf initramfs
-          mkdir -p initramfs/{bin,bin/tests,sbin,proc,sys,tmp}
+    - name: Prepare initramfs + tests binaries
+      run: |
+        set -e
+        rm -rf initramfs
+        mkdir -p initramfs/{bin,bin/tests,sbin,proc,sys,tmp}
 
-          # Copy test binaries into initramfs
-          for bin in target/x86_64-unknown-linux-musl/debug/deps/{fs_*,tokio-*}; do
-            if [ -f "$bin" ] && [ -x "$bin" ]; then
-              cp "$bin" initramfs/bin/tests
-            fi
-          done
-
-          # Add BusyBox & symlinks
-          cp /usr/bin/busybox initramfs/bin/
-          for cmd in sh mount uname true sleep; do ln -sf busybox initramfs/bin/$cmd; done
-          ln -sf ../bin/busybox initramfs/sbin/poweroff
-
-          # Generate init script
-          cat > initramfs/init << 'EOF'
-          #!/bin/sh
-          set -e
-          mkdir -p /dev
-          # create device nodes, as some tests require them
-          mknod /dev/null c 1 3
-          mknod /dev/zero c 1 5
-          mknod /dev/tty c 5 0
-          mount -t proc proc /proc
-          mount -t sysfs sysfs /sys
-          mkdir -p /tmp && mount -t tmpfs -o mode=1777 tmpfs /tmp
-          for f in /bin/tests/*; do RUST_BACKTRACE=1 "$f" ; done
-          EOF
-          chmod +x initramfs/init
-
-          # Pack into a CPIO archive
-          (cd initramfs && find . -print0 \
-            | cpio --null -ov --format=newc | gzip -9 > ../initramfs.cpio.gz)
-
-      - name: Run tests in QEMU
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          set +e
-          qemu-system-x86_64 \
-            -kernel linux-${{ env.KERNEL_VERSION }}/arch/x86/boot/bzImage \
-            -initrd initramfs.cpio.gz \
-            -append "console=ttyS0 rootfstype=ramfs panic=1" \
-            -nographic -no-reboot -m 1024 -action panic=exit-failure 2>&1 | tee qemu-output.log
-          qemu_status=${PIPESTATUS[0]} tee_status=${PIPESTATUS[1]}
-          set -e
-
-          if [ "$qemu_status" -ne 0 ]; then
-            echo "QEMU exited with status $qemu_status"
-            exit "$qemu_status"
+        # Copy test binaries into initramfs
+        for bin in target/x86_64-unknown-linux-musl/debug/deps/{fs_*,tokio-*}; do
+          if [ -f "$bin" ] && [ -x "$bin" ]; then
+            cp "$bin" initramfs/bin/tests
           fi
+        done
 
-          if [ "$tee_status" -ne 0 ]; then
-            echo "tee exited with status $tee_status"
-            exit "$tee_status"
-          fi
+        # Add BusyBox & symlinks
+        cp /usr/bin/busybox initramfs/bin/
+        for cmd in sh mount uname true sleep; do ln -sf busybox initramfs/bin/$cmd; done
+        ln -sf ../bin/busybox initramfs/sbin/poweroff
 
-          if grep -q "test result: FAILED" qemu-output.log; then
-            echo "tests reported failures"
-            exit 1
-          else
-            echo "all tests passed"
+        # Generate init script
+        cat > initramfs/init << 'EOF'
+        #!/bin/sh
+        set -e
+        mkdir -p /dev
+        # create device nodes, as some tests require them
+        mknod /dev/null c 1 3
+        mknod /dev/zero c 1 5
+        mknod /dev/tty c 5 0
+        mount -t proc proc /proc
+        mount -t sysfs sysfs /sys
+        mkdir -p /tmp && mount -t tmpfs -o mode=1777 tmpfs /tmp
+        for f in /bin/tests/*; do RUST_BACKTRACE=1 "$f" ; done
+        EOF
+        chmod +x initramfs/init
+
+        # Pack into a CPIO archive
+        (cd initramfs && find . -print0 \
+          | cpio --null -ov --format=newc | gzip -9 > ../initramfs.cpio.gz)
+
+    - name: Run tests in QEMU
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        set +e
+        qemu-system-x86_64 \
+          -kernel linux-${{ env.KERNEL_VERSION }}/arch/x86/boot/bzImage \
+          -initrd initramfs.cpio.gz \
+          -append "console=ttyS0 rootfstype=ramfs panic=1" \
+          -nographic -no-reboot -m 1024 -action panic=exit-failure 2>&1 | tee qemu-output.log
+        qemu_status=${PIPESTATUS[0]} tee_status=${PIPESTATUS[1]}
+        set -e
+
+        if [ "$qemu_status" -ne 0 ]; then
+          echo "QEMU exited with status $qemu_status"
+          exit "$qemu_status"
+        fi
+
+        if [ "$tee_status" -ne 0 ]; then
+          echo "tee exited with status $tee_status"
+          exit "$tee_status"
+        fi
+
+        if grep -q "test result: FAILED" qemu-output.log; then
+          echo "tests reported failures"
+          exit 1
+        else
+          echo "all tests passed"
+        fi
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
           fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
